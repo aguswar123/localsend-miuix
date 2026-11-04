@@ -1,0 +1,979 @@
+diff --git a/.github/workflows/build-apk.yml b/.github/workflows/build-apk.yml
+new file mode 100644
+index 0000000..e04adc8
+--- /dev/null
++++ b/.github/workflows/build-apk.yml
+@@ -0,0 +1,27 @@
++name: Build APK
++
++on:
++  push:
++    branches: [main]
++  workflow_dispatch:
++
++jobs:
++  build:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++
++      - uses: actions/setup-java@v4
++        with:
++          distribution: temurin
++          java-version: 21
++
++      - uses: gradle/actions/setup-gradle@v4
++
++      - name: Build debug APK
++        run: ./gradlew assembleDebug --no-daemon
++
++      - uses: actions/upload-artifact@v4
++        with:
++          name: localsend-miuix-fast-debug-apk
++          path: app/build/outputs/apk/debug/app-debug.apk
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 12d6e28..b263d3d 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -6,6 +6,9 @@
+ 
+ ## [未发布]
+ 
++### 新增
++- 发送页与接收页新增“极速模式”：通过 Wi-Fi 直连（优先 5GHz，无需路由器）连接两台手机，并启用高性能 Wi-Fi 锁、更大的传输缓冲与多文件并行上传；传输完成后点击“关闭极速模式”即可拆除直连并恢复正常网络。
++
+ ### 修复
+ - 修复了向官方 LocalSend 客户端发送纯文本消息时对方收到的是 .txt 文件而非文本消息的问题，协议 fileType 字段改用标准 MIME（text/plain），并继续兼容旧客户端的裸枚举名。
+ - 修复了纯文本消息内容超过 2000 字符时被截断发送、对方仅收到开头部分的问题，现完整内联发送，超过 512 KB 上限时自动降级为普通文本文件传输。
+diff --git a/app/src/main/AndroidManifest.xml b/app/src/main/AndroidManifest.xml
+index 10025a3..aa13564 100644
+--- a/app/src/main/AndroidManifest.xml
++++ b/app/src/main/AndroidManifest.xml
+@@ -7,6 +7,12 @@
+     <uses-permission android:name="android.permission.INTERNET" />
+     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
++    <!-- 极速模式（Wi-Fi Direct 直连） -->
++    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
++    <uses-permission
++        android:name="android.permission.NEARBY_WIFI_DEVICES"
++        android:usesPermissionFlags="neverForLocation" />
++    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" android:maxSdkVersion="32" />
+     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+     <!-- Android 17+ (API 37+) 局域网访问与多播发现前瞻性权限 -->
+     <uses-permission android:name="android.permission.ACCESS_LOCAL_NETWORK" />
+diff --git a/app/src/main/java/org/localsend/miuix/manager/LocalSendManager.kt b/app/src/main/java/org/localsend/miuix/manager/LocalSendManager.kt
+index d212700..72490c7 100644
+--- a/app/src/main/java/org/localsend/miuix/manager/LocalSendManager.kt
++++ b/app/src/main/java/org/localsend/miuix/manager/LocalSendManager.kt
+@@ -17,6 +17,9 @@ import kotlinx.coroutines.CoroutineScope
+ import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.Job
+ import kotlinx.coroutines.SupervisorJob
++import kotlinx.coroutines.async
++import kotlinx.coroutines.awaitAll
++import kotlinx.coroutines.coroutineScope
+ import kotlinx.coroutines.delay
+ import kotlinx.coroutines.flow.MutableStateFlow
+ import kotlinx.coroutines.flow.StateFlow
+@@ -26,7 +29,9 @@ import kotlinx.coroutines.isActive
+ import kotlinx.coroutines.joinAll
+ import kotlinx.coroutines.launch
+ import kotlinx.coroutines.sync.Mutex
++import kotlinx.coroutines.sync.Semaphore
+ import kotlinx.coroutines.sync.withLock
++import kotlinx.coroutines.sync.withPermit
+ import kotlinx.coroutines.withContext
+ import kotlinx.coroutines.withTimeoutOrNull
+ import kotlinx.serialization.decodeFromString
+@@ -49,6 +54,8 @@ import org.localsend.miuix.model.TransferHistoryItem
+ import org.localsend.miuix.model.TransferSession
+ import org.localsend.miuix.model.TransferStatus
+ import org.localsend.miuix.network.DiscoveryService
++import org.localsend.miuix.network.FastModeManager
++import org.localsend.miuix.network.FastModeTuning
+ import org.localsend.miuix.network.FingerprintTrust
+ import org.localsend.miuix.network.IncomingDecision
+ import org.localsend.miuix.network.LocalSendClient
+@@ -109,6 +116,26 @@ class LocalSendManager(
+     private val _nearbyDevices = MutableStateFlow<List<Device>>(emptyList())
+     val nearbyDevices: StateFlow<List<Device>> = _nearbyDevices.asStateFlow()
+ 
++    /** 极速模式（Wi-Fi Direct 直连 + 高吞吐传输参数）；链路建立/关闭后自动刷新附近设备。 */
++    val fastMode =
++        FastModeManager(
++            context = context,
++            onLinkReady = {
++                scope.launch {
++                    delay(1500)
++                    refreshDevices()
++                    delay(4000)
++                    refreshDevices()
++                }
++            },
++            onLinkClosed = {
++                scope.launch {
++                    delay(2000)
++                    refreshDevices()
++                }
++            },
++        )
++
+     private val _selectedFiles = MutableStateFlow<List<FileItem>>(emptyList())
+     val selectedFiles: StateFlow<List<FileItem>> = _selectedFiles.asStateFlow()
+ 
+@@ -290,6 +317,7 @@ class LocalSendManager(
+ 
+     fun stop() {
+         if (!started.compareAndSet(true, false)) return
++        fastMode.disable()
+         discoveryService.stop()
+         server.stop()
+         devicePruneJob?.cancel()
+@@ -585,13 +613,12 @@ class LocalSendManager(
+ 
+                 Log.i(TAG, "Starting transfer session $remoteSessionId to '${activeDevice.alias}' (${activeDevice.url}), ${filesToSend.size} files, ${fileTokens.size} tokens granted")
+ 
+-                for ((index, fileItem) in filesToSend.withIndex()) {
+-                    if (canceledSessionIds.contains(sessionId)) {
+-                        session.status = TransferStatus.Canceled
+-                        session.endTime = System.currentTimeMillis()
+-                        updateSessionState(session)
+-                        return@launch
+-                    }
++                // 单个文件的上传流程：普通模式按顺序逐个调用，极速模式下由信号量限制并发数
++                suspend fun uploadOne(
++                    index: Int,
++                    fileItem: FileItem,
++                ) {
++                    if (canceledSessionIds.contains(sessionId)) return
+                     val token = fileTokens[fileItem.id]
+                     if (token == null) {
+                         // 若该项为纯文本消息且其内容已在 prepare-upload 握手阶段通过 preview 完整提供，
+@@ -603,14 +630,14 @@ class LocalSendManager(
+                             fileItem.bytesTransferred = fileItem.size
+                             session.transferredBytes = filesToSend.sumOf { it.bytesTransferred }
+                             updateSessionState(session)
+-                            continue
++                            return
+                         }
+ 
+                         Log.w(TAG, "File '${fileItem.name}' (id=${fileItem.id}) has no token from peer! Skipping upload.")
+                         fileItem.status = TransferStatus.Failed
+                         fileItem.error = context.getString(R.string.msg_file_not_accepted)
+                         updateSessionState(session)
+-                        continue
++                        return
+                     }
+ 
+                     fileItem.status = TransferStatus.InProgress
+@@ -630,16 +657,12 @@ class LocalSendManager(
+                                 fileItem.progress = (bytesWritten.toFloat() / fileItem.size).coerceIn(0f, 1f)
+                             }
+                             session.transferredBytes = filesToSend.sumOf { it.bytesTransferred }
+-                            session.speed = speed
++                            // 并行上传时会话速度为所有进行中文件的速度之和（顺序上传时即当前文件速度）
++                            session.speed = filesToSend.filter { it.status == TransferStatus.InProgress }.sumOf { it.speed }
+                             updateSessionState(session)
+                         }
+ 
+-                    if (canceledSessionIds.contains(sessionId)) {
+-                        session.status = TransferStatus.Canceled
+-                        session.endTime = System.currentTimeMillis()
+-                        updateSessionState(session)
+-                        return@launch
+-                    }
++                    if (canceledSessionIds.contains(sessionId)) return
+                     if (uploadResult.isSuccess) {
+                         Log.i(TAG, "File [${index + 1}/${filesToSend.size}] completed: '${fileItem.name}'")
+                         fileItem.status = TransferStatus.Completed
+@@ -654,10 +677,32 @@ class LocalSendManager(
+                         fileItem.error = errMsg
+                     }
+                     updateSessionState(session)
++                }
+ 
+-                    if (index < filesToSend.size - 1) {
+-                        delay(30)
++                val parallelism = FastModeTuning.parallelUploads
++                if (parallelism <= 1 || filesToSend.size <= 1) {
++                    for ((index, fileItem) in filesToSend.withIndex()) {
++                        if (canceledSessionIds.contains(sessionId)) break
++                        uploadOne(index, fileItem)
++                        if (index < filesToSend.size - 1) {
++                            delay(30)
++                        }
+                     }
++                } else {
++                    val gate = Semaphore(parallelism)
++                    coroutineScope {
++                        filesToSend
++                            .withIndex()
++                            .map { (index, fileItem) -> async { gate.withPermit { uploadOne(index, fileItem) } } }
++                            .awaitAll()
++                    }
++                }
++
++                if (canceledSessionIds.contains(sessionId)) {
++                    session.status = TransferStatus.Canceled
++                    session.endTime = System.currentTimeMillis()
++                    updateSessionState(session)
++                    return@launch
+                 }
+ 
+                 val outcome =
+diff --git a/app/src/main/java/org/localsend/miuix/network/FastModeManager.kt b/app/src/main/java/org/localsend/miuix/network/FastModeManager.kt
+new file mode 100644
+index 0000000..eab033d
+--- /dev/null
++++ b/app/src/main/java/org/localsend/miuix/network/FastModeManager.kt
+@@ -0,0 +1,399 @@
++package org.localsend.miuix.network
++
++import android.Manifest
++import android.annotation.SuppressLint
++import android.content.BroadcastReceiver
++import android.content.Context
++import android.content.Intent
++import android.content.IntentFilter
++import android.content.pm.PackageManager
++import android.net.MacAddress
++import android.net.wifi.WifiManager
++import android.net.wifi.WpsInfo
++import android.net.wifi.p2p.WifiP2pConfig
++import android.net.wifi.p2p.WifiP2pManager
++import android.os.Build
++import android.os.Looper
++import android.os.PowerManager
++import android.util.Log
++import androidx.core.content.ContextCompat
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.asStateFlow
++import kotlinx.coroutines.flow.update
++import org.localsend.miuix.core.NetworkConstants
++
++/**
++ * 极速模式的传输参数开关：开启后使用更大的读写缓冲并允许多文件并行上传。
++ * 关闭（默认）时数值与原有行为完全一致。
++ */
++object FastModeTuning {
++    private const val NORMAL_BUFFER = 128 * 1024
++    private const val FAST_BUFFER = 512 * 1024
++    private const val FAST_PARALLEL_UPLOADS = 3
++
++    @Volatile
++    var enabled: Boolean = false
++
++    val bufferSize: Int
++        get() = if (enabled) FAST_BUFFER else NORMAL_BUFFER
++
++    val parallelUploads: Int
++        get() = if (enabled) FAST_PARALLEL_UPLOADS else 1
++}
++
++enum class FastModePhase { Off, Starting, Searching, Connecting, Connected, Error }
++
++enum class FastModeError { NoPermission, P2pUnsupported, P2pDisabled, ConnectFailed, Failed }
++
++data class FastPeer(
++    val name: String,
++    val address: String,
++)
++
++data class FastModeState(
++    val phase: FastModePhase = FastModePhase.Off,
++    val peers: List<FastPeer> = emptyList(),
++    val peerName: String? = null,
++    val error: FastModeError? = null,
++)
++
++/**
++ * 极速模式：通过 Wi-Fi Direct（点对点直连，优先 5GHz）在两台手机间建立不经过路由器的高速链路，
++ * 同时启用高性能 Wi-Fi 锁与更大的传输缓冲。链路建立后，对端会出现在“附近设备”中，
++ * 之后沿用原有的 LocalSend 协议传输。点击“关闭极速模式”会拆除直连组、释放所有锁并恢复原有网络。
++ */
++class FastModeManager(
++    context: Context,
++    private val onLinkReady: () -> Unit,
++    private val onLinkClosed: () -> Unit,
++) {
++    companion object {
++        private const val TAG = "FastMode"
++        private const val WAKE_LOCK_TIMEOUT_MS = 30 * 60 * 1000L
++
++        /** Android 13+ 使用 NEARBY_WIFI_DEVICES；更低版本的 Wi-Fi Direct 发现需要定位权限。 */
++        fun requiredPermissions(): Array<String> =
++            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
++                arrayOf(Manifest.permission.NEARBY_WIFI_DEVICES)
++            } else {
++                arrayOf(Manifest.permission.ACCESS_FINE_LOCATION)
++            }
++    }
++
++    private val appContext = context.applicationContext
++    private val _state = MutableStateFlow(FastModeState())
++    val state: StateFlow<FastModeState> = _state.asStateFlow()
++
++    private var p2pManager: WifiP2pManager? = null
++    private var channel: WifiP2pManager.Channel? = null
++    private var receiver: BroadcastReceiver? = null
++    private var wifiLock: WifiManager.WifiLock? = null
++    private var wakeLock: PowerManager.WakeLock? = null
++
++    fun hasRequiredPermissions(): Boolean =
++        requiredPermissions().all {
++            ContextCompat.checkSelfPermission(appContext, it) == PackageManager.PERMISSION_GRANTED
++        }
++
++    fun reportPermissionDenied() {
++        _state.value = FastModeState(phase = FastModePhase.Error, error = FastModeError.NoPermission)
++    }
++
++    private fun isActive(): Boolean = _state.value.phase != FastModePhase.Off && _state.value.phase != FastModePhase.Error
++
++    /** 开启极速模式：申请锁、注册直连广播并开始发现附近设备。 */
++    @SuppressLint("MissingPermission")
++    fun enable() {
++        if (isActive()) return
++        if (!hasRequiredPermissions()) {
++            reportPermissionDenied()
++            return
++        }
++        val manager = appContext.getSystemService(Context.WIFI_P2P_SERVICE) as? WifiP2pManager
++        if (manager == null || !appContext.packageManager.hasSystemFeature(PackageManager.FEATURE_WIFI_DIRECT)) {
++            _state.value = FastModeState(phase = FastModePhase.Error, error = FastModeError.P2pUnsupported)
++            return
++        }
++        val newChannel =
++            manager.initialize(appContext, Looper.getMainLooper()) {
++                Log.w(TAG, "Wi-Fi Direct channel disconnected")
++                fail(FastModeError.Failed)
++            }
++        if (newChannel == null) {
++            _state.value = FastModeState(phase = FastModePhase.Error, error = FastModeError.P2pUnsupported)
++            return
++        }
++        p2pManager = manager
++        channel = newChannel
++        FastModeTuning.enabled = true
++        acquireLocks()
++        registerReceiver()
++        _state.value = FastModeState(phase = FastModePhase.Starting)
++        discoverPeers()
++    }
++
++    /** 关闭极速模式：拆除直连组、停止发现、释放锁，网络与传输参数恢复正常。 */
++    fun disable() {
++        val wasActive = isActive()
++        teardown()
++        _state.value = FastModeState()
++        if (wasActive) onLinkClosed()
++    }
++
++    private fun fail(error: FastModeError) {
++        teardown()
++        _state.value = FastModeState(phase = FastModePhase.Error, error = error)
++        onLinkClosed()
++    }
++
++    @SuppressLint("MissingPermission")
++    private fun teardown() {
++        unregisterReceiver()
++        val manager = p2pManager
++        val ch = channel
++        if (manager != null && ch != null) {
++            try {
++                manager.cancelConnect(ch, null)
++                manager.stopPeerDiscovery(ch, null)
++                manager.removeGroup(ch, null)
++            } catch (e: Exception) {
++                Log.w(TAG, "teardown: ${e.message}")
++            }
++            try {
++                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) ch.close()
++            } catch (_: Exception) {
++            }
++        }
++        channel = null
++        p2pManager = null
++        releaseLocks()
++        FastModeTuning.enabled = false
++    }
++
++    @SuppressLint("MissingPermission")
++    private fun discoverPeers() {
++        val manager = p2pManager ?: return
++        val ch = channel ?: return
++        try {
++            manager.discoverPeers(
++                ch,
++                object : WifiP2pManager.ActionListener {
++                    override fun onSuccess() {
++                        _state.update { if (it.phase == FastModePhase.Starting) it.copy(phase = FastModePhase.Searching) else it }
++                    }
++
++                    override fun onFailure(reason: Int) {
++                        Log.w(TAG, "discoverPeers failed: $reason")
++                        if (reason == WifiP2pManager.P2P_UNSUPPORTED) {
++                            fail(FastModeError.P2pUnsupported)
++                        } else {
++                            // BUSY/ERROR 多为瞬时状态，保持搜索态，广播到来时仍可刷新
++                            _state.update { if (it.phase == FastModePhase.Starting) it.copy(phase = FastModePhase.Searching) else it }
++                        }
++                    }
++                },
++            )
++        } catch (e: SecurityException) {
++            fail(FastModeError.NoPermission)
++        }
++    }
++
++    /** 向选中的对端发起直连；优先请求 5GHz，失败后自动回退到系统默认频段。 */
++    @SuppressLint("MissingPermission")
++    fun connect(peer: FastPeer) {
++        val manager = p2pManager ?: return
++        val ch = channel ?: return
++        _state.update { it.copy(phase = FastModePhase.Connecting, peerName = peer.name, error = null) }
++        val prefer5Ghz = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q
++        connectWith(manager, ch, peer, prefer5Ghz)
++    }
++
++    @SuppressLint("MissingPermission")
++    private fun connectWith(
++        manager: WifiP2pManager,
++        ch: WifiP2pManager.Channel,
++        peer: FastPeer,
++        use5Ghz: Boolean,
++    ) {
++        val config =
++            try {
++                buildConfig(peer.address, use5Ghz)
++            } catch (e: Exception) {
++                _state.update { it.copy(phase = FastModePhase.Searching, error = FastModeError.ConnectFailed) }
++                return
++            }
++        try {
++            manager.connect(
++                ch,
++                config,
++                object : WifiP2pManager.ActionListener {
++                    override fun onSuccess() {
++                        // 等待系统广播确认直连组已形成
++                    }
++
++                    override fun onFailure(reason: Int) {
++                        Log.w(TAG, "connect failed (5GHz=$use5Ghz): $reason")
++                        if (use5Ghz) {
++                            connectWith(manager, ch, peer, use5Ghz = false)
++                        } else {
++                            _state.update { it.copy(phase = FastModePhase.Searching, error = FastModeError.ConnectFailed) }
++                        }
++                    }
++                },
++            )
++        } catch (e: SecurityException) {
++            fail(FastModeError.NoPermission)
++        }
++    }
++
++    private fun buildConfig(
++        address: String,
++        use5Ghz: Boolean,
++    ): WifiP2pConfig =
++        if (use5Ghz && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
++            WifiP2pConfig
++                .Builder()
++                .setDeviceAddress(MacAddress.fromString(address))
++                .setGroupOperatingBand(WifiP2pConfig.GROUP_OWNER_BAND_5GHZ)
++                .build()
++        } else {
++            WifiP2pConfig().apply {
++                deviceAddress = address
++                wps.setup = WpsInfo.PBC
++            }
++        }
++
++    private fun registerReceiver() {
++        if (receiver != null) return
++        val filter =
++            IntentFilter().apply {
++                addAction(WifiP2pManager.WIFI_P2P_STATE_CHANGED_ACTION)
++                addAction(WifiP2pManager.WIFI_P2P_PEERS_CHANGED_ACTION)
++                addAction(WifiP2pManager.WIFI_P2P_CONNECTION_STATE_CHANGE_ACTION)
++            }
++        val newReceiver =
++            object : BroadcastReceiver() {
++                override fun onReceive(
++                    context: Context?,
++                    intent: Intent?,
++                ) {
++                    when (intent?.action) {
++                        WifiP2pManager.WIFI_P2P_STATE_CHANGED_ACTION -> {
++                            val state = intent.getIntExtra(WifiP2pManager.EXTRA_WIFI_STATE, -1)
++                            if (state == WifiP2pManager.WIFI_P2P_STATE_DISABLED) fail(FastModeError.P2pDisabled)
++                        }
++                        WifiP2pManager.WIFI_P2P_PEERS_CHANGED_ACTION -> refreshPeers()
++                        WifiP2pManager.WIFI_P2P_CONNECTION_STATE_CHANGE_ACTION -> refreshConnection()
++                    }
++                }
++            }
++        ContextCompat.registerReceiver(appContext, newReceiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED)
++        receiver = newReceiver
++    }
++
++    private fun unregisterReceiver() {
++        receiver?.let {
++            try {
++                appContext.unregisterReceiver(it)
++            } catch (_: Exception) {
++            }
++        }
++        receiver = null
++    }
++
++    @SuppressLint("MissingPermission")
++    private fun refreshPeers() {
++        val manager = p2pManager ?: return
++        val ch = channel ?: return
++        try {
++            manager.requestPeers(ch) { list ->
++                val peers =
++                    list.deviceList
++                        .filter { !it.deviceAddress.isNullOrEmpty() }
++                        .map { FastPeer(name = it.deviceName.orEmpty().ifEmpty { it.deviceAddress }, address = it.deviceAddress) }
++                        .sortedBy { it.name.lowercase() }
++                _state.update { it.copy(peers = peers) }
++            }
++        } catch (e: SecurityException) {
++            fail(FastModeError.NoPermission)
++        }
++    }
++
++    @SuppressLint("MissingPermission")
++    private fun refreshConnection() {
++        val manager = p2pManager ?: return
++        val ch = channel ?: return
++        try {
++            manager.requestConnectionInfo(ch) { info ->
++                if (info != null && info.groupFormed) {
++                    val wasConnected = _state.value.phase == FastModePhase.Connected
++                    _state.update { it.copy(phase = FastModePhase.Connected, error = null) }
++                    resolvePeerName(manager, ch)
++                    if (!wasConnected) onLinkReady()
++                } else if (_state.value.phase == FastModePhase.Connected) {
++                    // 对端断开直连组：回到搜索态，保持极速模式开启直至用户手动关闭
++                    _state.update { it.copy(phase = FastModePhase.Searching, peerName = null) }
++                    discoverPeers()
++                }
++            }
++        } catch (e: SecurityException) {
++            fail(FastModeError.NoPermission)
++        }
++    }
++
++    @SuppressLint("MissingPermission")
++    private fun resolvePeerName(
++        manager: WifiP2pManager,
++        ch: WifiP2pManager.Channel,
++    ) {
++        try {
++            manager.requestGroupInfo(ch) { group ->
++                val name =
++                    if (group == null) {
++                        null
++                    } else if (group.isGroupOwner) {
++                        group.clientList.firstOrNull()?.deviceName
++                    } else {
++                        group.owner?.deviceName
++                    }
++                if (!name.isNullOrEmpty()) _state.update { it.copy(peerName = name) }
++            }
++        } catch (_: Exception) {
++        }
++    }
++
++    @Suppress("DEPRECATION")
++    private fun acquireLocks() {
++        try {
++            if (wifiLock == null) {
++                val wifiManager = appContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
++                wifiLock =
++                    wifiManager?.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "${NetworkConstants.WIFI_LOCK_TAG}:fast")?.apply {
++                        setReferenceCounted(false)
++                        acquire()
++                    }
++            }
++            if (wakeLock == null) {
++                val powerManager = appContext.getSystemService(Context.POWER_SERVICE) as? PowerManager
++                wakeLock =
++                    powerManager?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "${NetworkConstants.WAKE_LOCK_TAG}:fast")?.apply {
++                        setReferenceCounted(false)
++                        acquire(WAKE_LOCK_TIMEOUT_MS)
++                    }
++            }
++        } catch (e: Exception) {
++            Log.w(TAG, "acquireLocks: ${e.message}")
++        }
++    }
++
++    private fun releaseLocks() {
++        try {
++            wifiLock?.takeIf { it.isHeld }?.release()
++            wakeLock?.takeIf { it.isHeld }?.release()
++        } catch (_: Exception) {
++        }
++        wifiLock = null
++        wakeLock = null
++    }
++}
+diff --git a/app/src/main/java/org/localsend/miuix/network/LocalSendClient.kt b/app/src/main/java/org/localsend/miuix/network/LocalSendClient.kt
+index 6dd3484..9d8f3d1 100644
+--- a/app/src/main/java/org/localsend/miuix/network/LocalSendClient.kt
++++ b/app/src/main/java/org/localsend/miuix/network/LocalSendClient.kt
+@@ -279,8 +279,9 @@ class LocalSendClient(
+         var connection: HttpURLConnection? = null
+         var isSucceeded = false
+         val startTime = System.currentTimeMillis()
++        val bufferSize = FastModeTuning.bufferSize
+         return try {
+-            inputStream = openSourceStream(fileItem)?.buffered(128 * 1024)
++            inputStream = openSourceStream(fileItem)?.buffered(bufferSize)
+                 ?: throw IllegalStateException("Cannot open input stream for ${fileItem.name}")
+ 
+             val encodedSessionId = URLEncoder.encode(sessionId, "UTF-8")
+@@ -305,7 +306,7 @@ class LocalSendClient(
+                     if (fileItem.size > 0L) {
+                         setFixedLengthStreamingMode(fileItem.size)
+                     } else {
+-                        setChunkedStreamingMode(128 * 1024)
++                        setChunkedStreamingMode(bufferSize)
+                     }
+                     connectTimeout = 15000
+                     readTimeout = 120000
+@@ -314,8 +315,8 @@ class LocalSendClient(
+                     setRequestProperty("Keep-Alive", "timeout=60")
+                 }
+ 
+-            val outputStream: OutputStream = connection.outputStream.buffered(128 * 1024)
+-            val buffer = ByteArray(128 * 1024)
++            val outputStream: OutputStream = connection.outputStream.buffered(bufferSize)
++            val buffer = ByteArray(bufferSize)
+             var bytesWritten = 0L
+             var lastTime = System.currentTimeMillis()
+             var bytesSinceLast = 0L
+diff --git a/app/src/main/java/org/localsend/miuix/network/LocalSendServer.kt b/app/src/main/java/org/localsend/miuix/network/LocalSendServer.kt
+index e65532c..07a34ff 100644
+--- a/app/src/main/java/org/localsend/miuix/network/LocalSendServer.kt
++++ b/app/src/main/java/org/localsend/miuix/network/LocalSendServer.kt
+@@ -702,9 +702,10 @@ class LocalSendServer(
+                                     null
+                                 }
+ 
+-                            saveTargetWriter.openSaveStream(fileItem, saveTarget) { getAutoCategorizeMedia() }.buffered(128 * 1024).use { fos ->
++                            val bufferSize = FastModeTuning.bufferSize
++                            saveTargetWriter.openSaveStream(fileItem, saveTarget) { getAutoCategorizeMedia() }.buffered(bufferSize).use { fos ->
+                                 val channel = call.receiveChannel()
+-                                val buffer = ByteArray(128 * 1024)
++                                val buffer = ByteArray(bufferSize)
+                                 var lastTime = System.currentTimeMillis()
+                                 var bytesSinceLast = 0L
+                                 var smoothedSpeed = 0L
+@@ -716,7 +717,6 @@ class LocalSendServer(
+                                     textBuffer?.write(buffer, 0, read)
+                                     digest?.update(buffer, 0, read)
+                                     fileItem.bytesTransferred += read
+-                                    session.transferredBytes = session.files.sumOf { it.bytesTransferred }
+                                     bytesSinceLast += read
+ 
+                                     val now = System.currentTimeMillis()
+@@ -726,6 +726,7 @@ class LocalSendServer(
+                                     }
+                                     val delta = now - lastTime
+                                     if (delta >= 64) {
++                                        session.transferredBytes = session.files.sumOf { it.bytesTransferred }
+                                         val instantSpeed = (bytesSinceLast * 1000) / delta
+                                         smoothedSpeed = if (smoothedSpeed == 0L) instantSpeed else (smoothedSpeed * 3 + instantSpeed) / 4
+                                         fileItem.speed = smoothedSpeed
+@@ -739,6 +740,7 @@ class LocalSendServer(
+                                     }
+                                 }
+                                 fos.flush()
++                                session.transferredBytes = session.files.sumOf { it.bytesTransferred }
+                                 if (bytesSinceLast > 0 || fileItem.bytesTransferred == fileItem.size) {
+                                     if (fileItem.size > 0) {
+                                         fileItem.progress = (fileItem.bytesTransferred.toFloat() / fileItem.size).coerceIn(0f, 1f)
+diff --git a/app/src/main/java/org/localsend/miuix/ui/component/FastModeCard.kt b/app/src/main/java/org/localsend/miuix/ui/component/FastModeCard.kt
+new file mode 100644
+index 0000000..b78dd37
+--- /dev/null
++++ b/app/src/main/java/org/localsend/miuix/ui/component/FastModeCard.kt
+@@ -0,0 +1,151 @@
++package org.localsend.miuix.ui.component
++
++import androidx.activity.compose.rememberLauncherForActivityResult
++import androidx.activity.result.contract.ActivityResultContracts
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.padding
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.collectAsState
++import androidx.compose.runtime.getValue
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.res.stringResource
++import androidx.compose.ui.unit.dp
++import org.localsend.miuix.R
++import org.localsend.miuix.manager.LocalSendManager
++import org.localsend.miuix.model.TransferStatus
++import org.localsend.miuix.network.FastModeError
++import org.localsend.miuix.network.FastModeManager
++import org.localsend.miuix.network.FastModePhase
++import top.yukonga.miuix.kmp.basic.Button
++import top.yukonga.miuix.kmp.basic.ButtonDefaults
++import top.yukonga.miuix.kmp.basic.Card
++import top.yukonga.miuix.kmp.basic.Text
++import top.yukonga.miuix.kmp.preference.ArrowPreference
++import top.yukonga.miuix.kmp.preference.SwitchPreference
++import top.yukonga.miuix.kmp.theme.MiuixTheme
++
++/**
++ * 极速模式卡片（发送页 / 接收页共用）。
++ * 开启后通过 Wi-Fi Direct 直连两台手机；传输完成后点击“关闭极速模式”即可拆除直连并恢复正常网络。
++ *
++ * @param showPeers 发送页为 true：列出附近可直连的设备供选择；接收页为 false：仅等待对方连接。
++ */
++@Composable
++fun FastModeCard(
++    manager: LocalSendManager,
++    showPeers: Boolean,
++    modifier: Modifier = Modifier,
++) {
++    val fastMode = manager.fastMode
++    val state by fastMode.state.collectAsState()
++    val activeSessions by manager.activeSessions.collectAsState()
++    val transferRunning = activeSessions.any { it.status == TransferStatus.InProgress }
++
++    val permissionLauncher =
++        rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { result ->
++            if (result.isNotEmpty() && result.values.all { it }) {
++                fastMode.enable()
++            } else {
++                fastMode.reportPermissionDenied()
++            }
++        }
++
++    val isOn = state.phase != FastModePhase.Off && state.phase != FastModePhase.Error
++    val peerName = state.peerName.orEmpty()
++    val summary =
++        when (state.phase) {
++            FastModePhase.Off -> stringResource(R.string.fast_mode_summary_off)
++            FastModePhase.Starting -> stringResource(R.string.fast_mode_summary_starting)
++            FastModePhase.Searching ->
++                if (showPeers) {
++                    stringResource(R.string.fast_mode_summary_searching_send)
++                } else {
++                    stringResource(R.string.fast_mode_summary_searching_receive)
++                }
++            FastModePhase.Connecting -> stringResource(R.string.fast_mode_summary_connecting, peerName)
++            FastModePhase.Connected ->
++                if (peerName.isEmpty()) {
++                    stringResource(R.string.fast_mode_summary_connected_unknown)
++                } else {
++                    stringResource(R.string.fast_mode_summary_connected, peerName)
++                }
++            FastModePhase.Error -> stringResource(R.string.fast_mode_summary_error)
++        }
++
++    Card(modifier = modifier.fillMaxWidth()) {
++        SwitchPreference(
++            title = stringResource(R.string.fast_mode_title),
++            summary = summary,
++            checked = isOn,
++            onCheckedChange = { enabled ->
++                if (!enabled) {
++                    fastMode.disable()
++                } else if (fastMode.hasRequiredPermissions()) {
++                    fastMode.enable()
++                } else {
++                    permissionLauncher.launch(FastModeManager.requiredPermissions())
++                }
++            },
++        )
++
++        val errorText =
++            when (state.error) {
++                FastModeError.NoPermission -> stringResource(R.string.fast_mode_error_permission)
++                FastModeError.P2pUnsupported -> stringResource(R.string.fast_mode_error_unsupported)
++                FastModeError.P2pDisabled -> stringResource(R.string.fast_mode_error_disabled)
++                FastModeError.ConnectFailed -> stringResource(R.string.fast_mode_error_connect)
++                FastModeError.Failed -> stringResource(R.string.fast_mode_error_generic)
++                null -> null
++            }
++        if (errorText != null) {
++            Text(
++                text = errorText,
++                style = MiuixTheme.textStyles.footnote1,
++                color = MiuixTheme.colorScheme.error,
++                modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
++            )
++        }
++
++        if (showPeers && (state.phase == FastModePhase.Searching || state.phase == FastModePhase.Connecting)) {
++            if (state.peers.isEmpty()) {
++                Text(
++                    text = stringResource(R.string.fast_mode_no_peers),
++                    style = MiuixTheme.textStyles.footnote1,
++                    color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
++                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
++                )
++            }
++            state.peers.forEach { peer ->
++                ArrowPreference(
++                    title = peer.name,
++                    summary = stringResource(R.string.fast_mode_peer_summary),
++                    onClick = { fastMode.connect(peer) },
++                )
++            }
++        }
++
++        if (isOn) {
++            Text(
++                text =
++                    when {
++                        transferRunning -> stringResource(R.string.fast_mode_hint_transferring)
++                        state.phase == FastModePhase.Connected -> stringResource(R.string.fast_mode_hint_done)
++                        else -> stringResource(R.string.fast_mode_hint_close)
++                    },
++                style = MiuixTheme.textStyles.footnote1,
++                color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
++                modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
++            )
++            Button(
++                onClick = { fastMode.disable() },
++                colors = if (transferRunning) ButtonDefaults.buttonColors() else ButtonDefaults.buttonColorsPrimary(),
++                modifier =
++                    Modifier
++                        .fillMaxWidth()
++                        .padding(horizontal = 16.dp, vertical = 8.dp),
++            ) {
++                Text(stringResource(R.string.fast_mode_btn_close))
++            }
++        }
++    }
++}
+diff --git a/app/src/main/java/org/localsend/miuix/ui/screen/ReceiveScreen.kt b/app/src/main/java/org/localsend/miuix/ui/screen/ReceiveScreen.kt
+index ee22be8..cbf1f9a 100644
+--- a/app/src/main/java/org/localsend/miuix/ui/screen/ReceiveScreen.kt
++++ b/app/src/main/java/org/localsend/miuix/ui/screen/ReceiveScreen.kt
+@@ -34,6 +34,7 @@ import org.localsend.miuix.manager.LocalSendManager
+ import org.localsend.miuix.network.NetworkUtils
+ import org.localsend.miuix.ui.component.AppIcons
+ import org.localsend.miuix.ui.component.BlurredBar
++import org.localsend.miuix.ui.component.FastModeCard
+ import org.localsend.miuix.ui.component.TransferSessionCard
+ import org.localsend.miuix.ui.component.blurBackdropSource
+ import org.localsend.miuix.ui.component.rememberBlurBackdrop
+@@ -144,6 +145,13 @@ fun ReceiveScreen(
+                     }
+                 }
+ 
++                // Section 1.5: Fast Mode (Wi-Fi Direct)
++                item {
++                    Spacer(modifier = Modifier.height(4.dp))
++                    SmallTitle(text = stringResource(R.string.fast_mode_section))
++                    FastModeCard(manager = manager, showPeers = false)
++                }
++
+                 // Section 2: Quick Receive Preferences
+                 item {
+                     Spacer(modifier = Modifier.height(4.dp))
+diff --git a/app/src/main/java/org/localsend/miuix/ui/screen/SendScreen.kt b/app/src/main/java/org/localsend/miuix/ui/screen/SendScreen.kt
+index 30d4f8f..bf7db3f 100644
+--- a/app/src/main/java/org/localsend/miuix/ui/screen/SendScreen.kt
++++ b/app/src/main/java/org/localsend/miuix/ui/screen/SendScreen.kt
+@@ -50,6 +50,7 @@ import org.localsend.miuix.model.FileItem
+ import org.localsend.miuix.model.TransferSession
+ import org.localsend.miuix.ui.component.AppIcons
+ import org.localsend.miuix.ui.component.BlurredBar
++import org.localsend.miuix.ui.component.FastModeCard
+ import org.localsend.miuix.ui.component.FilePreviewDialog
+ import org.localsend.miuix.ui.component.FileThumbnail
+ import org.localsend.miuix.ui.component.InlineTransferProgress
+@@ -286,6 +287,11 @@ fun SendScreen(
+                         }
+                     }
+ 
++                    // Section 1.7: Fast Mode (Wi-Fi Direct)
++                    item {
++                        FastModeCard(manager = manager, showPeers = true)
++                    }
++
+                     // Section 2: Selected Content Queue（仅在选择内容后显示）
+                     if (selectedFiles.isNotEmpty()) {
+                         item {
+diff --git a/app/src/main/res/values-en/strings.xml b/app/src/main/res/values-en/strings.xml
+index 3eaa4d9..1890fbd 100644
+--- a/app/src/main/res/values-en/strings.xml
++++ b/app/src/main/res/values-en/strings.xml
+@@ -480,4 +480,27 @@
+     <string name="toast_install_permission_needed">Permission to install unknown apps is required</string>
+     <string name="toast_install_source_unavailable">APK is no longer accessible; install canceled</string>
+     <string name="notif_action_install">Install</string>
++
++    <!-- Fast mode (Wi-Fi Direct) -->
++    <string name="fast_mode_section">Fast Mode</string>
++    <string name="fast_mode_title">Fast transfer (Wi-Fi Direct)</string>
++    <string name="fast_mode_summary_off">Connect two phones directly over 5 GHz, no router needed, for much higher speed</string>
++    <string name="fast_mode_summary_starting">Starting…</string>
++    <string name="fast_mode_summary_searching_send">Searching for nearby devices. Turn on Fast Mode on the other phone too</string>
++    <string name="fast_mode_summary_searching_receive">Visible to nearby devices. Pick this phone on the sender, then accept the invitation here</string>
++    <string name="fast_mode_summary_connecting">Connecting to %1$s. Accept the invitation on the other phone…</string>
++    <string name="fast_mode_summary_connected">Directly connected to %1$s</string>
++    <string name="fast_mode_summary_connected_unknown">Direct link established</string>
++    <string name="fast_mode_summary_error">Fast Mode unavailable</string>
++    <string name="fast_mode_peer_summary">Tap to connect directly</string>
++    <string name="fast_mode_no_peers">No devices found yet. Make sure the other phone has Fast Mode on and Wi-Fi enabled</string>
++    <string name="fast_mode_hint_transferring">Transferring… close Fast Mode when finished to restore your normal network</string>
++    <string name="fast_mode_hint_done">Direct link ready. The other phone will appear under Nearby Devices. Close Fast Mode below when you are done</string>
++    <string name="fast_mode_hint_close">Close Fast Mode when finished and your network returns to normal</string>
++    <string name="fast_mode_btn_close">Close Fast Mode</string>
++    <string name="fast_mode_error_permission">Nearby devices permission (Location on Android 12 and below) is required for Wi-Fi Direct</string>
++    <string name="fast_mode_error_unsupported">This device does not support Wi-Fi Direct</string>
++    <string name="fast_mode_error_disabled">Wi-Fi Direct is not enabled. Turn on Wi-Fi (and Location services on Android 12 and below)</string>
++    <string name="fast_mode_error_connect">Connection failed. Try again and make sure the other phone accepted the invitation</string>
++    <string name="fast_mode_error_generic">Fast Mode hit a problem and was closed</string>
+ </resources>
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index 2051365..f8de752 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -480,4 +480,27 @@
+     <string name="toast_install_permission_needed">需要允许安装未知应用权限</string>
+     <string name="toast_install_source_unavailable">安装包不可访问，无法发起安装</string>
+     <string name="notif_action_install">安装</string>
++
++    <!-- 极速模式 (Wi-Fi Direct) -->
++    <string name="fast_mode_section">极速模式</string>
++    <string name="fast_mode_title">极速传输 (Wi-Fi 直连)</string>
++    <string name="fast_mode_summary_off">两台手机直连 5GHz，不经过路由器，速度更快</string>
++    <string name="fast_mode_summary_starting">正在启动…</string>
++    <string name="fast_mode_summary_searching_send">正在搜索附近设备，请在对方手机也开启极速模式</string>
++    <string name="fast_mode_summary_searching_receive">已对附近设备可见，请在发送方选择本机并在此接受连接邀请</string>
++    <string name="fast_mode_summary_connecting">正在连接 %1$s，请在对方手机上接受邀请…</string>
++    <string name="fast_mode_summary_connected">已与 %1$s 直连</string>
++    <string name="fast_mode_summary_connected_unknown">已建立直连</string>
++    <string name="fast_mode_summary_error">极速模式不可用</string>
++    <string name="fast_mode_peer_summary">点击发起直连</string>
++    <string name="fast_mode_no_peers">暂未发现设备。请确认对方已开启极速模式，且双方 Wi-Fi 已打开</string>
++    <string name="fast_mode_hint_transferring">传输中… 完成后请关闭极速模式以恢复正常网络</string>
++    <string name="fast_mode_hint_done">直连已就绪。连接后对方会出现在“附近设备”中，传输完成请点击下方按钮关闭</string>
++    <string name="fast_mode_hint_close">用完后请关闭极速模式，网络将恢复正常</string>
++    <string name="fast_mode_btn_close">关闭极速模式</string>
++    <string name="fast_mode_error_permission">需要“附近设备”(Android 13 以下为“位置”)权限才能使用 Wi-Fi 直连</string>
++    <string name="fast_mode_error_unsupported">此设备不支持 Wi-Fi 直连</string>
++    <string name="fast_mode_error_disabled">Wi-Fi 直连未启用，请先打开 Wi-Fi（Android 12 及以下还需打开定位服务）</string>
++    <string name="fast_mode_error_connect">连接失败，请重试或确认对方已接受邀请</string>
++    <string name="fast_mode_error_generic">极速模式出现异常，已自动关闭</string>
+ </resources>
+diff --git a/gradlew b/gradlew
+old mode 100644
+new mode 100755

@@ -480,4 +480,27 @@
     <string name="toast_install_permission_needed">Permission to install unknown apps is required</string>
     <string name="toast_install_source_unavailable">APK is no longer accessible; install canceled</string>
     <string name="notif_action_install">Install</string>
+
+    <!-- Fast mode (Wi-Fi Direct) -->
+    <string name="fast_mode_section">Fast Mode</string>
+    <string name="fast_mode_title">Fast transfer (Wi-Fi Direct)</string>
+    <string name="fast_mode_summary_off">Connect two phones directly over 5 GHz, no router needed, for much higher speed</string>
+    <string name="fast_mode_summary_starting">Starting…</string>
+    <string name="fast_mode_summary_searching_send">Searching for nearby devices. Turn on Fast Mode on the other phone too</string>
+    <string name="fast_mode_summary_searching_receive">Visible to nearby devices. Pick this phone on the sender, then accept the invitation here</string>
+    <string name="fast_mode_summary_connecting">Connecting to %1$s. Accept the invitation on the other phone…</string>
+    <string name="fast_mode_summary_connected">Directly connected to %1$s</string>
+    <string name="fast_mode_summary_connected_unknown">Direct link established</string>
+    <string name="fast_mode_summary_error">Fast Mode unavailable</string>
+    <string name="fast_mode_peer_summary">Tap to connect directly</string>
+    <string name="fast_mode_no_peers">No devices found yet. Make sure the other phone has Fast Mode on and Wi-Fi enabled</string>
+    <string name="fast_mode_hint_transferring">Transferring… close Fast Mode when finished to restore your normal network</string>
+    <string name="fast_mode_hint_done">Direct link ready. The other phone will appear under Nearby Devices. Close Fast Mode below when you are done</string>
+    <string name="fast_mode_hint_close">Close Fast Mode when finished and your network returns to normal</string>
+    <string name="fast_mode_btn_close">Close Fast Mode</string>
+    <string name="fast_mode_error_permission">Nearby devices permission (Location on Android 12 and below) is required for Wi-Fi Direct</string>
+    <string name="fast_mode_error_unsupported">This device does not support Wi-Fi Direct</string>
+    <string name="fast_mode_error_disabled">Wi-Fi Direct is not enabled. Turn on Wi-Fi (and Location services on Android 12 and below)</string>
+    <string name="fast_mode_error_connect">Connection failed. Try again and make sure the other phone accepted the invitation</string>
+    <string name="fast_mode_error_generic">Fast Mode hit a problem and was closed</string>
 </resources>

@@ -17,6 +17,9 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -26,7 +29,9 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.decodeFromString
@@ -49,6 +54,8 @@ import org.localsend.miuix.model.TransferHistoryItem
 import org.localsend.miuix.model.TransferSession
 import org.localsend.miuix.model.TransferStatus
 import org.localsend.miuix.network.DiscoveryService
+import org.localsend.miuix.network.FastModeManager
+import org.localsend.miuix.network.FastModeTuning
 import org.localsend.miuix.network.FingerprintTrust
 import org.localsend.miuix.network.IncomingDecision
 import org.localsend.miuix.network.LocalSendClient
@@ -108,6 +115,26 @@ class LocalSendManager(
 
     private val _nearbyDevices = MutableStateFlow<List<Device>>(emptyList())
     val nearbyDevices: StateFlow<List<Device>> = _nearbyDevices.asStateFlow()
+
+    /** 极速模式（Wi-Fi Direct 直连 + 高吞吐传输参数）；链路建立/关闭后自动刷新附近设备。 */
+    val fastMode =
+        FastModeManager(
+            context = context,
+            onLinkReady = {
+                scope.launch {
+                    delay(1500)
+                    refreshDevices()
+                    delay(4000)
+                    refreshDevices()
+                }
+            },
+            onLinkClosed = {
+                scope.launch {
+                    delay(2000)
+                    refreshDevices()
+                }
+            },
+        )
 
     private val _selectedFiles = MutableStateFlow<List<FileItem>>(emptyList())
     val selectedFiles: StateFlow<List<FileItem>> = _selectedFiles.asStateFlow()
@@ -290,6 +317,7 @@ class LocalSendManager(
 
     fun stop() {
         if (!started.compareAndSet(true, false)) return
+        fastMode.disable()
         discoveryService.stop()
         server.stop()
         devicePruneJob?.cancel()
@@ -585,13 +613,12 @@ class LocalSendManager(
 
                 Log.i(TAG, "Starting transfer session $remoteSessionId to '${activeDevice.alias}' (${activeDevice.url}), ${filesToSend.size} files, ${fileTokens.size} tokens granted")
 
-                for ((index, fileItem) in filesToSend.withIndex()) {
-                    if (canceledSessionIds.contains(sessionId)) {
-                        session.status = TransferStatus.Canceled
-                        session.endTime = System.currentTimeMillis()
-                        updateSessionState(session)
-                        return@launch
-                    }
+                // 单个文件的上传流程：普通模式按顺序逐个调用，极速模式下由信号量限制并发数
+                suspend fun uploadOne(
+                    index: Int,
+                    fileItem: FileItem,
+                ) {
+                    if (canceledSessionIds.contains(sessionId)) return
                     val token = fileTokens[fileItem.id]
                     if (token == null) {
                         // 若该项为纯文本消息且其内容已在 prepare-upload 握手阶段通过 preview 完整提供，
@@ -603,14 +630,14 @@ class LocalSendManager(
                             fileItem.bytesTransferred = fileItem.size
                             session.transferredBytes = filesToSend.sumOf { it.bytesTransferred }
                             updateSessionState(session)
-                            continue
+                            return
                         }
 
                         Log.w(TAG, "File '${fileItem.name}' (id=${fileItem.id}) has no token from peer! Skipping upload.")
                         fileItem.status = TransferStatus.Failed
                         fileItem.error = context.getString(R.string.msg_file_not_accepted)
                         updateSessionState(session)
-                        continue
+                        return
                     }
 
                     fileItem.status = TransferStatus.InProgress
@@ -630,16 +657,12 @@ class LocalSendManager(
                                 fileItem.progress = (bytesWritten.toFloat() / fileItem.size).coerceIn(0f, 1f)
                             }
                             session.transferredBytes = filesToSend.sumOf { it.bytesTransferred }
-                            session.speed = speed
+                            // 并行上传时会话速度为所有进行中文件的速度之和（顺序上传时即当前文件速度）
+                            session.speed = filesToSend.filter { it.status == TransferStatus.InProgress }.sumOf { it.speed }
                             updateSessionState(session)
                         }
 
-                    if (canceledSessionIds.contains(sessionId)) {
-                        session.status = TransferStatus.Canceled
-                        session.endTime = System.currentTimeMillis()
-                        updateSessionState(session)
-                        return@launch
-                    }
+                    if (canceledSessionIds.contains(sessionId)) return
                     if (uploadResult.isSuccess) {
                         Log.i(TAG, "File [${index + 1}/${filesToSend.size}] completed: '${fileItem.name}'")
                         fileItem.status = TransferStatus.Completed
@@ -654,10 +677,32 @@ class LocalSendManager(
                         fileItem.error = errMsg
                     }
                     updateSessionState(session)
+                }
 
-                    if (index < filesToSend.size - 1) {
-                        delay(30)
+                val parallelism = FastModeTuning.parallelUploads
+                if (parallelism <= 1 || filesToSend.size <= 1) {
+                    for ((index, fileItem) in filesToSend.withIndex()) {
+                        if (canceledSessionIds.contains(sessionId)) break
+                        uploadOne(index, fileItem)
+                        if (index < filesToSend.size - 1) {
+                            delay(30)
+                        }
                     }
+                } else {
+                    val gate = Semaphore(parallelism)
+                    coroutineScope {
+                        filesToSend
+                            .withIndex()
+                            .map { (index, fileItem) -> async { gate.withPermit { uploadOne(index, fileItem) } } }
+                            .awaitAll()
+                    }
+                }
+
+                if (canceledSessionIds.contains(sessionId)) {
+                    session.status = TransferStatus.Canceled
+                    session.endTime = System.currentTimeMillis()
+                    updateSessionState(session)
+                    return@launch
                 }
 
                 val outcome =

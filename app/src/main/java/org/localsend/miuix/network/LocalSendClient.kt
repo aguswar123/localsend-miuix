@@ -279,8 +279,9 @@ class LocalSendClient(
         var connection: HttpURLConnection? = null
         var isSucceeded = false
         val startTime = System.currentTimeMillis()
+        val bufferSize = FastModeTuning.bufferSize
         return try {
-            inputStream = openSourceStream(fileItem)?.buffered(128 * 1024)
+            inputStream = openSourceStream(fileItem)?.buffered(bufferSize)
                 ?: throw IllegalStateException("Cannot open input stream for ${fileItem.name}")
 
             val encodedSessionId = URLEncoder.encode(sessionId, "UTF-8")
@@ -305,7 +306,7 @@ class LocalSendClient(
                     if (fileItem.size > 0L) {
                         setFixedLengthStreamingMode(fileItem.size)
                     } else {
-                        setChunkedStreamingMode(128 * 1024)
+                        setChunkedStreamingMode(bufferSize)
                     }
                     connectTimeout = 15000
                     readTimeout = 120000
@@ -314,8 +315,8 @@ class LocalSendClient(
                     setRequestProperty("Keep-Alive", "timeout=60")
                 }
 
-            val outputStream: OutputStream = connection.outputStream.buffered(128 * 1024)
-            val buffer = ByteArray(128 * 1024)
+            val outputStream: OutputStream = connection.outputStream.buffered(bufferSize)
+            val buffer = ByteArray(bufferSize)
             var bytesWritten = 0L
             var lastTime = System.currentTimeMillis()
             var bytesSinceLast = 0L

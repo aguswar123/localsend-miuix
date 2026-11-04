@@ -480,4 +480,27 @@
     <string name="toast_install_permission_needed">需要允许安装未知应用权限</string>
     <string name="toast_install_source_unavailable">安装包不可访问，无法发起安装</string>
     <string name="notif_action_install">安装</string>
+
+    <!-- 极速模式 (Wi-Fi Direct) -->
+    <string name="fast_mode_section">极速模式</string>
+    <string name="fast_mode_title">极速传输 (Wi-Fi 直连)</string>
+    <string name="fast_mode_summary_off">两台手机直连 5GHz，不经过路由器，速度更快</string>
+    <string name="fast_mode_summary_starting">正在启动…</string>
+    <string name="fast_mode_summary_searching_send">正在搜索附近设备，请在对方手机也开启极速模式</string>
+    <string name="fast_mode_summary_searching_receive">已对附近设备可见，请在发送方选择本机并在此接受连接邀请</string>
+    <string name="fast_mode_summary_connecting">正在连接 %1$s，请在对方手机上接受邀请…</string>
+    <string name="fast_mode_summary_connected">已与 %1$s 直连</string>
+    <string name="fast_mode_summary_connected_unknown">已建立直连</string>
+    <string name="fast_mode_summary_error">极速模式不可用</string>
+    <string name="fast_mode_peer_summary">点击发起直连</string>
+    <string name="fast_mode_no_peers">暂未发现设备。请确认对方已开启极速模式，且双方 Wi-Fi 已打开</string>
+    <string name="fast_mode_hint_transferring">传输中… 完成后请关闭极速模式以恢复正常网络</string>
+    <string name="fast_mode_hint_done">直连已就绪。连接后对方会出现在“附近设备”中，传输完成请点击下方按钮关闭</string>
+    <string name="fast_mode_hint_close">用完后请关闭极速模式，网络将恢复正常</string>
+    <string name="fast_mode_btn_close">关闭极速模式</string>
+    <string name="fast_mode_error_permission">需要“附近设备”(Android 13 以下为“位置”)权限才能使用 Wi-Fi 直连</string>
+    <string name="fast_mode_error_unsupported">此设备不支持 Wi-Fi 直连</string>
+    <string name="fast_mode_error_disabled">Wi-Fi 直连未启用，请先打开 Wi-Fi（Android 12 及以下还需打开定位服务）</string>
+    <string name="fast_mode_error_connect">连接失败，请重试或确认对方已接受邀请</string>
+    <string name="fast_mode_error_generic">极速模式出现异常，已自动关闭</string>
 </resources>

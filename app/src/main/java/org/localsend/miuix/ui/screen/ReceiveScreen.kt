@@ -34,6 +34,7 @@ import org.localsend.miuix.manager.LocalSendManager
 import org.localsend.miuix.network.NetworkUtils
 import org.localsend.miuix.ui.component.AppIcons
 import org.localsend.miuix.ui.component.BlurredBar
+import org.localsend.miuix.ui.component.FastModeCard
 import org.localsend.miuix.ui.component.TransferSessionCard
 import org.localsend.miuix.ui.component.blurBackdropSource
 import org.localsend.miuix.ui.component.rememberBlurBackdrop
@@ -142,6 +143,13 @@ fun ReceiveScreen(
                             },
                         )
                     }
+                }
+
+                // Section 1.5: Fast Mode (Wi-Fi Direct)
+                item {
+                    Spacer(modifier = Modifier.height(4.dp))
+                    SmallTitle(text = stringResource(R.string.fast_mode_section))
+                    FastModeCard(manager = manager, showPeers = false)
                 }
 
                 // Section 2: Quick Receive Preferences

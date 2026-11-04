@@ -50,6 +50,7 @@ import org.localsend.miuix.model.FileItem
 import org.localsend.miuix.model.TransferSession
 import org.localsend.miuix.ui.component.AppIcons
 import org.localsend.miuix.ui.component.BlurredBar
+import org.localsend.miuix.ui.component.FastModeCard
 import org.localsend.miuix.ui.component.FilePreviewDialog
 import org.localsend.miuix.ui.component.FileThumbnail
 import org.localsend.miuix.ui.component.InlineTransferProgress
@@ -284,6 +285,11 @@ fun SendScreen(
                                 onClick = onOpenWebShare,
                             )
                         }
+                    }
+
+                    // Section 1.7: Fast Mode (Wi-Fi Direct)
+                    item {
+                        FastModeCard(manager = manager, showPeers = true)
                     }
 
                     // Section 2: Selected Content Queue（仅在选择内容后显示）

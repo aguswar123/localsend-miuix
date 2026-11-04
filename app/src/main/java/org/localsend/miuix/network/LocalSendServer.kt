@@ -702,9 +702,10 @@ class LocalSendServer(
                                     null
                                 }
 
-                            saveTargetWriter.openSaveStream(fileItem, saveTarget) { getAutoCategorizeMedia() }.buffered(128 * 1024).use { fos ->
+                            val bufferSize = FastModeTuning.bufferSize
+                            saveTargetWriter.openSaveStream(fileItem, saveTarget) { getAutoCategorizeMedia() }.buffered(bufferSize).use { fos ->
                                 val channel = call.receiveChannel()
-                                val buffer = ByteArray(128 * 1024)
+                                val buffer = ByteArray(bufferSize)
                                 var lastTime = System.currentTimeMillis()
                                 var bytesSinceLast = 0L
                                 var smoothedSpeed = 0L
@@ -716,7 +717,6 @@ class LocalSendServer(
                                     textBuffer?.write(buffer, 0, read)
                                     digest?.update(buffer, 0, read)
                                     fileItem.bytesTransferred += read
-                                    session.transferredBytes = session.files.sumOf { it.bytesTransferred }
                                     bytesSinceLast += read
 
                                     val now = System.currentTimeMillis()
@@ -726,6 +726,7 @@ class LocalSendServer(
                                     }
                                     val delta = now - lastTime
                                     if (delta >= 64) {
+                                        session.transferredBytes = session.files.sumOf { it.bytesTransferred }
                                         val instantSpeed = (bytesSinceLast * 1000) / delta
                                         smoothedSpeed = if (smoothedSpeed == 0L) instantSpeed else (smoothedSpeed * 3 + instantSpeed) / 4
                                         fileItem.speed = smoothedSpeed
@@ -739,6 +740,7 @@ class LocalSendServer(
                                     }
                                 }
                                 fos.flush()
+                                session.transferredBytes = session.files.sumOf { it.bytesTransferred }
                                 if (bytesSinceLast > 0 || fileItem.bytesTransferred == fileItem.size) {
                                     if (fileItem.size > 0) {
                                         fileItem.progress = (fileItem.bytesTransferred.toFloat() / fileItem.size).coerceIn(0f, 1f)

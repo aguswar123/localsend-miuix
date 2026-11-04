@@ -270,7 +270,7 @@ class FastModeManager(
             IntentFilter().apply {
                 addAction(WifiP2pManager.WIFI_P2P_STATE_CHANGED_ACTION)
                 addAction(WifiP2pManager.WIFI_P2P_PEERS_CHANGED_ACTION)
-                addAction(WifiP2pManager.WIFI_P2P_CONNECTION_STATE_CHANGE_ACTION)
+                addAction(WifiP2pManager.WIFI_P2P_CONNECTION_CHANGED_ACTION)
             }
         val newReceiver =
             object : BroadcastReceiver() {
@@ -284,7 +284,7 @@ class FastModeManager(
                             if (state == WifiP2pManager.WIFI_P2P_STATE_DISABLED) fail(FastModeError.P2pDisabled)
                         }
                         WifiP2pManager.WIFI_P2P_PEERS_CHANGED_ACTION -> refreshPeers()
-                        WifiP2pManager.WIFI_P2P_CONNECTION_STATE_CHANGE_ACTION -> refreshConnection()
+                        WifiP2pManager.WIFI_P2P_CONNECTION_CHANGED_ACTION -> refreshConnection()
                     }
                 }
             }
